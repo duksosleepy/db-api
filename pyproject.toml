@@ -1,0 +1,14 @@
+[project]
+name = "db-api"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "asyncpg>=0.30.0",
+    "fastapi>=0.115.12",
+    "loguru>=0.7.3",
+    "pgvector>=0.4.0",
+    "python-dotenv>=1.1.0",
+    "uvicorn>=0.34.2",
+]
