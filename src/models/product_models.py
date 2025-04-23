@@ -1,16 +1,22 @@
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel
 
 
-class PortfolioEntryCreate(BaseModel):
-    content: str
+class ProductCreate(BaseModel):
+    name: str
+    brand: str
+    color: str
+    material: str
 
 
-class PortfolioEntryResponse(BaseModel):
+class ProductResponse(BaseModel):
     id: int
-    content: str
-    embedding: Optional[list[float]]
+    name: str
+    brand: str
+    color: str
+    material: str
+    embedding: Optional[List[float]] = None
 
 
 class QueryRequest(BaseModel):
@@ -18,5 +24,8 @@ class QueryRequest(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    content: str
+    name: str
+    brand: str
+    color: str
+    material: str
     similarity: float

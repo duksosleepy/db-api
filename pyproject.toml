@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "asyncpg>=0.30.0",
     "fastapi>=0.115.12",
+    "fastembed>=0.6.1",
     "loguru>=0.7.3",
     "pgvector>=0.4.0",
     "python-dotenv>=1.1.0",
