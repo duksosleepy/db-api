@@ -1,132 +1,240 @@
+import asyncio
 import os
-import time
+from typing import List, Tuple
 
-import psycopg2
-from openai import OpenAI
-from pgvector.psycopg2 import register_vector
+import asyncpg
+import dotenv
+import numpy as np
+from fastembed import TextEmbedding
+from loguru import logger
+from pgvector.asyncpg import register_vector
 
-# Tune this batch size to optimize throughput.
-# For example, try 10, then 20, then 50 depending on the average token count in your texts.
+# Tune this batch size to optimize throughput
 BATCH_SIZE = 30
 
+# Initialize the embedding model once
+embedding_model = TextEmbedding(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
 
-def get_batch_embeddings(client, texts, model, max_retries=5):
+
+async def generate_batch_embeddings(texts: List[str]) -> List[List[float]]:
     """
-    Retrieve embeddings for a list of texts in one API call.
-    Uses exponential backoff for rate-limit errors.
-    Returns a list of embeddings.
+    Generate embeddings for a list of texts using FastEmbed.
+
+    Parameters
+    ----------
+    texts : List[str]
+        List of text strings to generate embeddings for
+
+    Returns
+    -------
+    List[List[float]]
+        List of embedding vectors
     """
-    delay = 0.2  # initial delay in seconds
-    for attempt in range(max_retries):
-        try:
-            response = client.embeddings.create(input=texts, model=model)
-            return [item.embedding for item in response.data]
-        except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "insufficient_quota" in error_str:
-                print(
-                    f"Encountered rate limit/quota error: {error_str}. Retrying in {delay} seconds for batch of size {len(texts)}..."
+    try:
+        # Clean text by replacing newlines with spaces
+        cleaned_texts = [text.replace("\n", " ") for text in texts if text]
+
+        # Generate embeddings for all texts in the batch
+        embeddings = list(embedding_model.embed(cleaned_texts))
+
+        # Convert embeddings to lists
+        return [embedding.tolist() for embedding in embeddings]
+    except Exception as e:
+        logger.error(f"Error generating embeddings: {e}")
+        raise
+
+
+async def update_table_embeddings(
+    conn: asyncpg.Connection, table_name: str, id_column: str, text_column: str
+) -> None:
+    """
+    Update the embedding column for all rows in a given table using batched processing.
+
+    Parameters
+    ----------
+    conn : asyncpg.Connection
+        Database connection
+    table_name : str
+        Name of the table to update
+    id_column : str
+        Name of the ID column
+    text_column : str
+        Name of the text column to generate embeddings from
+    """
+    try:
+        # Fetch all rows that need embeddings
+        rows = await conn.fetch(
+            f"SELECT {id_column}, {text_column} FROM {table_name};"
+        )
+
+        if not rows:
+            logger.info(f"No rows found in table {table_name}.")
+            return
+
+        # Prepare batches
+        batches: List[Tuple[List[int], List[str]]] = []
+        current_ids: List[int] = []
+        current_texts: List[str] = []
+
+        for row in rows:
+            row_id, text = row[id_column], row[text_column]
+            if not text:
+                logger.warning(
+                    f"{table_name.capitalize()} {id_column} {row_id} has no {text_column}; skipping."
                 )
-                time.sleep(delay)
-                delay *= 2  # exponential backoff
-            else:
-                print(f"Non-retryable error: {error_str}")
-                raise
-    raise Exception(
-        "Failed to get embeddings after maximum retries for a batch."
-    )
+                continue
+
+            current_ids.append(row_id)
+            current_texts.append(text)
+
+            if len(current_texts) >= BATCH_SIZE:
+                batches.append((current_ids, current_texts))
+                current_ids = []
+                current_texts = []
+
+        if current_texts:
+            batches.append((current_ids, current_texts))
+
+        total = sum(len(batch_ids) for batch_ids, _ in batches)
+        logger.info(
+            f"Processing {total} rows from {table_name} in {len(batches)} batches (batch size = {BATCH_SIZE})..."
+        )
+
+        # Process each batch
+        for batch_ids, batch_texts in batches:
+            try:
+                # Generate embeddings for this batch
+                embeddings = await generate_batch_embeddings(batch_texts)
+
+                # Update database with embeddings
+                for row_id, embedding in zip(batch_ids, embeddings):
+                    # Convert embedding to numpy array for pgvector
+                    embedding_np = np.array(embedding)
+                    await conn.execute(
+                        f"UPDATE {table_name} SET embedding = $1 WHERE {id_column} = $2;",
+                        embedding_np,
+                        row_id,
+                    )
+
+                logger.info(
+                    f"Updated batch for {table_name}: {len(batch_ids)} rows"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error processing batch for {table_name} with {len(batch_ids)} rows: {e}"
+                )
+
+    except Exception as e:
+        logger.error(f"Error updating embeddings for table {table_name}: {e}")
+        raise
 
 
-def update_table_embeddings(conn, table_name, id_column, text_column, model):
+async def update_product_embeddings(conn: asyncpg.Connection) -> None:
     """
-    Update the embedding column for all rows in a given table using batched API calls.
+    Update embeddings for products by combining text fields and generating embeddings.
+
+    Parameters
+    ----------
+    conn : asyncpg.Connection
+        Database connection
     """
-    cur = conn.cursor()
-    cur.execute(f"SELECT {id_column}, {text_column} FROM {table_name};")
-    rows = cur.fetchall()
-    if not rows:
-        print(f"No rows found in table {table_name}.")
-        cur.close()
+    try:
+        # Get products that need embeddings
+        rows = await conn.fetch(
+            """
+            SELECT id, name, brand, color, material
+            FROM product_embeddings
+            WHERE embedding IS NULL OR array_length(embedding, 1) = 0
+            """
+        )
+
+        if not rows:
+            logger.info("No products found that need embeddings.")
+            return
+
+        logger.info(f"Found {len(rows)} products that need embeddings.")
+
+        # Process in batches
+        batch_size = BATCH_SIZE
+        total_products = len(rows)
+
+        for i in range(0, total_products, batch_size):
+            batch = rows[i : i + batch_size]
+            product_ids = []
+            combined_texts = []
+
+            # Combine text fields for each product
+            for row in batch:
+                product_id = row["id"]
+                # Combine fields just like in product_routes.py
+                combined_text = f"{row['name']} {row['brand']} {row['color']} {row['material']}"
+
+                product_ids.append(product_id)
+                combined_texts.append(combined_text)
+
+            # Generate embeddings for the batch
+            embeddings = await generate_batch_embeddings(combined_texts)
+
+            # Update each product with its embedding
+            for product_id, embedding in zip(product_ids, embeddings):
+                embedding_np = np.array(embedding)
+                await conn.execute(
+                    """
+                    UPDATE product_embeddings
+                    SET embedding = $1
+                    WHERE id = $2
+                    """,
+                    embedding_np,
+                    product_id,
+                )
+
+            logger.info(
+                f"Updated embeddings for batch of {len(batch)} products ({i + len(batch)}/{total_products})"
+            )
+
+    except Exception as e:
+        logger.error(f"Error updating product embeddings: {e}")
+        raise
+
+
+async def main() -> None:
+    """
+    Main function to update embeddings in the product_embeddings table in the lug_rag database.
+    """
+    # Load environment variables
+    dotenv.load_dotenv()
+
+    # Connect to PostgreSQL database
+    DATABASE_URL = os.environ.get("DATABASE_URL")
+    if not DATABASE_URL:
+        logger.error("DATABASE_URL environment variable not set.")
         return
 
-    # Prepare batches: each batch is a tuple of (list_of_ids, list_of_texts)
-    batches = []
-    current_ids = []
-    current_texts = []
-    for row in rows:
-        row_id, text = row
-        if not text:
-            print(
-                f"{table_name.capitalize()} {id_column} {row_id} has no {text_column}; skipping."
-            )
-            continue
-        current_ids.append(row_id)
-        current_texts.append(text)
-        if len(current_texts) >= BATCH_SIZE:
-            batches.append((current_ids, current_texts))
-            current_ids = []
-            current_texts = []
-    if current_texts:
-        batches.append((current_ids, current_texts))
+    try:
+        # Initialize connection pool with pgvector support
+        logger.info("Initializing PostgreSQL connection pool...")
 
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    total = sum(len(batch_ids) for batch_ids, _ in batches)
-    print(
-        f"Processing {total} rows from {table_name} in {len(batches)} batches (batch size = {BATCH_SIZE})..."
-    )
+        async def initalize_vector(conn):
+            await register_vector(conn)
 
-    for batch_ids, batch_texts in batches:
-        try:
-            embeddings = get_batch_embeddings(client, batch_texts, model)
-            for row_id, embedding in zip(batch_ids, embeddings):
-                cur.execute(
-                    f"UPDATE {table_name} SET embedding = %s WHERE {id_column} = %s;",
-                    (embedding, row_id),
-                )
-            conn.commit()
-            print(f"Updated batch for {table_name}: {batch_ids}")
-            # Optional: adjust this delay if you are not hitting rate limits.
-            time.sleep(0.5)
-        except Exception as e:
-            print(
-                f"Error processing batch for {table_name} with IDs {batch_ids}: {e}"
-            )
-    cur.close()
+        conn_pool = await asyncpg.create_pool(
+            dsn=os.getenv("DATABASE_URL"), init=initalize_vector
+        )
+        logger.info("PostgreSQL connection pool created successfully.")
+        # Update product embeddings
+        logger.info(
+            "Starting embedding update process for product_embeddings table..."
+        )
+        await update_product_embeddings(conn_pool)
 
+        await conn_pool.close()
+        logger.info("Embedding update process completed successfully.")
 
-def main():
-    # We use text-embedding-ada-002 which returns 1536-dimensional vectors.
-    model = "text-embedding-ada-002"
-
-    # Connect to your PostgreSQL database
-    DATABASE_URL = os.environ.get(
-        "DATABASE_URL", "postgresql://postgres@localhost/dvdrental"
-    )
-    conn = psycopg2.connect(DATABASE_URL)
-    register_vector(conn)
-
-    # Update embeddings in the film table
-    print("Updating film embeddings...")
-    update_table_embeddings(
-        conn,
-        table_name="film",
-        id_column="film_id",
-        text_column="description",
-        model=model,
-    )
-
-    # Update embeddings in the netflix_shows table
-    print("Updating netflix_shows embeddings...")
-    update_table_embeddings(
-        conn,
-        table_name="netflix_shows",
-        id_column="show_id",
-        text_column="description",
-        model=model,
-    )
-
-    conn.close()
+    except Exception as e:
+        logger.error(f"Error in main function: {e}")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
