@@ -16,11 +16,11 @@ async def init_postgres() -> None:
     try:
         logger.info("Initializing PostgreSQL connection pool...")
 
-        async def initalize_vector(conn):
+        async def initialize_vector(conn):
             await register_vector(conn)
 
         conn_pool = await asyncpg.create_pool(
-            dsn=os.getenv("DATABASE_URL"), init=initalize_vector
+            dsn=os.getenv("DATABASE_URL"), init=initialize_vector
         )
         logger.info("PostgreSQL connection pool created successfully.")
 

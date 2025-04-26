@@ -146,7 +146,7 @@ async def update_product_embeddings(conn: asyncpg.Connection) -> None:
             """
             SELECT id, name, brand, color, material
             FROM product_embeddings
-            WHERE embedding IS NULL OR array_length(embedding, 1) = 0
+            WHERE embedding IS NULL OR vector_dims(embedding) = 0
             """
         )
 
@@ -216,18 +216,21 @@ async def main() -> None:
         # Initialize connection pool with pgvector support
         logger.info("Initializing PostgreSQL connection pool...")
 
-        async def initalize_vector(conn):
+        async def initialize_vector(conn):
             await register_vector(conn)
 
         conn_pool = await asyncpg.create_pool(
-            dsn=os.getenv("DATABASE_URL"), init=initalize_vector
+            dsn=os.getenv("DATABASE_URL"), init=initialize_vector
         )
         logger.info("PostgreSQL connection pool created successfully.")
-        # Update product embeddings
+
+        # Update product embeddings - use a connection from the pool
         logger.info(
             "Starting embedding update process for product_embeddings table..."
         )
-        await update_product_embeddings(conn_pool)
+
+        async with conn_pool.acquire() as conn:
+            await update_product_embeddings(conn)
 
         await conn_pool.close()
         logger.info("Embedding update process completed successfully.")

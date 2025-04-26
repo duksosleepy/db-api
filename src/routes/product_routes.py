@@ -68,6 +68,9 @@ async def add_product(
                 product.material,
                 embedding_np,
             )
+
+            # Return the row data - this was missing
+            return row
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to add product: {e}"
@@ -90,7 +93,7 @@ async def query_products(
             rows = await conn.fetch(
                 """
                 SELECT name, brand, color, material, embedding <=> $1 AS similarity
-                FROM products
+                FROM product_embeddings
                 ORDER BY similarity
                 LIMIT 5
                 """,
