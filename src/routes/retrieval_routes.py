@@ -16,34 +16,15 @@ from utils.auth import validate_api_key
 router = APIRouter()
 
 
+# Updated retrieval_routes.py with SQL query logging
+
+
 @router.post("/retrieval", response_model=RetrievalResponse)
 async def retrieval(
     request: RetrievalRequest,
     api_key: str = Depends(validate_api_key),
     pool: asyncpg.Pool = Depends(get_postgres),
 ):
-    """
-    Retrieve documents from product_embeddings based on similarity to query.
-
-    Parameters
-    ----------
-    request : RetrievalRequest
-        Request payload with knowledge_id, query, and retrieval settings
-    api_key : str
-        API key from Bearer token (validated by dependency)
-    pool : asyncpg.Pool
-        Database connection pool
-
-    Returns
-    -------
-    RetrievalResponse
-        Response with matching documents
-
-    Raises
-    ------
-    HTTPException
-        If retrieval fails
-    """
     try:
         # Extract parameters
         knowledge_id = request.knowledge_id
@@ -59,30 +40,39 @@ async def retrieval(
         query_embedding = await generate_embedding(query)
         query_embedding_np = np.array(query_embedding)
 
+        # Log planned SQL query (without embedding values for brevity)
+        sql_query = """
+        SELECT id, name, brand, color, material,
+               1 - (embedding <=> $1) AS similarity
+        FROM public.product_embeddings
+        WHERE 1 - (embedding <=> $1) >= $2
+        ORDER BY similarity DESC
+        LIMIT $3
+        """
+
+        logger.info(f"Executing SQL query: {sql_query}")
+        logger.info(
+            f"Query parameters: score_threshold={score_threshold}, top_k={top_k}"
+        )
+
         # Get database connection
         async with pool.acquire() as conn:
-            # Retrieve similar products
-            # Note: 1 - (embedding <=> $1) converts distance to similarity score
+            # Execute the query with improved ordering and similarity calculation
             rows = await conn.fetch(
-                """
-                SELECT id, name, brand, color, material
-                FROM public.product_embeddings
-                ORDER BY embedding <-> $1 DESC
-                """,
-                query_embedding_np,
+                sql_query, query_embedding_np, score_threshold, top_k
             )
 
-            # Filter by score threshold and limit results
-            filtered_rows = [
-                row for row in rows if row["similarity"] >= score_threshold
-            ]
-            limited_rows = filtered_rows[:top_k]
+            logger.info(f"Query returned {len(rows)} rows")
 
-            # Format results into response
+            # Process results as before
             records = []
-            for row in limited_rows:
-                # Combine product attributes for content field
-                content = f"{row['name']} is a {row['color']} product made of {row['material']} by {row['brand']}."
+            for row in rows:
+                # Log individual row data for debugging
+                logger.debug(
+                    f"Processing row: id={row['id']}, name={row['name']}, similarity={row['similarity']}"
+                )
+
+                content = f"{row['name']}, {row['color']}, {row['material']}, {row['brand']}."
 
                 record = RecordResponse(
                     metadata=Metadata(
@@ -95,7 +85,6 @@ async def retrieval(
                 )
                 records.append(record)
 
-            # Create response
             response = RetrievalResponse(records=records)
             logger.info(f"Returning {len(records)} matching products")
             return response
